@@ -1,0 +1,23 @@
+csv_location = "2022_place_canvas_history.csv"
+end_time = "2022-04-04 21:32:37.541 UTC"
+[[search_areas]]
+[search_areas.start]
+x=496
+y=120
+[search_areas.end]
+x=634
+y=293
+[[search_areas]]
+[search_areas.start]
+x=21
+y=680
+[search_areas.end]
+x=70
+y=757
+[[search_areas]]
+[search_areas.start]
+x=287
+y=960
+[search_areas.end]
+x=435
+y=999
