@@ -1,5 +1,6 @@
 csv_location = "2022_place_canvas_history.csv"
 end_time = "2022-04-04 21:32:37.541 UTC"
+no_edits_outside = true
 [[search_areas]]
 [search_areas.start]
 x=496
