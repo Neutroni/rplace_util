@@ -4,7 +4,6 @@ no_edits_outside = true
 [[search_areas]]
 #start_time = 2022-04-01 12:00:00.001 UTC
 #end_time = 2022-04-04 12:00:00.001 UTC
-#is_required = false
 [search_areas.area]
 left=496
 top=120
