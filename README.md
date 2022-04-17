@@ -19,9 +19,7 @@ Sample configuration file is provided in the repository as `config.toml`
 Configuration file needs to contain the location of the CSV file used to
 store canvas edits, compressed archive of the file can be downloaded from 
 [Reddit](https://placedata.reddit.com/data/canvas-history/2022_place_canvas_history.csv.gzip)
-`csv_location` defines the location of the uncompressed CSV file
-
-Other configuration options are:
+* `csv_location` defines the location of the uncompressed CSV file
 * `user_id` Which defines the hashed user id of the user we want to analyze
 contributions for, if you do not know the user id hash program can find
 potential users based on users who edited areas on the canvas
