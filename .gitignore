@@ -11,3 +11,6 @@ Cargo.lock
 
 #IDE Files
 /.idea/
+
+#Tile data
+2022_place_canvas_history.csv
