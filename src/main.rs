@@ -154,6 +154,8 @@ struct SearchArea {
     start_time: Option<PrimitiveDateTime>,
     #[serde(with = "rplace_time_format::option", default)]
     end_time: Option<PrimitiveDateTime>,
+    #[serde(default)]
+    is_optional: bool,
     area: TileRegion,
 }
 
@@ -254,13 +256,20 @@ fn find_user(settings: &Settings) -> Option<String> {
         mutate_user_list(remove_external_edits, locations.clone(), &settings.csv_location, users.clone());
     }
 
+    //Set of search areas that user must be present in
+    let required_ares: HashSet<TileRegion> = locations.iter().filter(|a| {
+        !a.is_optional
+    }).map(|r| {
+        r.area.clone()
+    }).collect();
+
     //Remove uses who did not have edits in all selected areas
     let user = match users.lock() {
         Ok(mut g) => {
             //Remove elements which were not found in all selected areas
             info!("Removing users who do not have edits in all selected areas");
             g.retain(|_, regions| {
-                regions.len() == locations.len()
+                regions.is_superset(&required_ares)
             });
             let potential_users: Vec<String> = g.clone().into_keys().collect();
             if potential_users.is_empty() {
