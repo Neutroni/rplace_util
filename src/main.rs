@@ -248,13 +248,13 @@ fn find_user(settings: &Settings) -> Option<String> {
         HashMap::<String, HashSet<TileRegion>>::new()));
 
     //Get list of potential users in selected areas
-    let locations = Arc::new(settings.search_areas.clone());
+    let locations = &settings.search_areas;
     info!("Finding users who have edits in selected areas");
-    mutate_user_list(add_internal_edits, &locations, &settings.csv_location, users.clone());
+    mutate_user_list(add_internal_edits, locations, &settings.csv_location, users.clone());
     //If enabled remove users who have edits outside selected areas
     if settings.no_edits_outside {
         info!("Removing users who have edits outside selected areas");
-        mutate_user_list(remove_external_edits, &locations, &settings.csv_location, users.clone());
+        mutate_user_list(remove_external_edits, locations, &settings.csv_location, users.clone());
     }
 
     //Set of search areas that user must be present in
