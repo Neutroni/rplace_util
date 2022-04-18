@@ -28,6 +28,7 @@ should be removed from the list of potential users, default is 'true'
 * `search_areas` is array of tables that defines the areas that are to be searched
     * `start_time` Optional, Defines the earliest time user can have edited a pixel in the search area 
     * `end_time` Optional, Defines the latest time user can have edited a pixel in the search area
+    * `is_optional` Optional, Do not remove users who have edits in area but do not require edits in the area
     * `area` Defines the edges of the area to search
         * `left` X-coordinate of the left edge of the search area
         * `top` Y-coordinate of the top edge of the search area
