@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::{env, io, thread};
+use std::{env, io};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use config::Config;
-use crossbeam_channel::{bounded, Receiver};
+use rayon::iter::ParallelBridge;
+use rayon::prelude::ParallelIterator;
 use log::{error, info, warn};
 use nom::IResult;
 use nom::bytes::complete::{take_until};
@@ -249,11 +250,11 @@ fn find_user(settings: &Settings) -> Option<String> {
     //Get list of potential users in selected areas
     let locations = Arc::new(settings.search_areas.clone());
     info!("Finding users who have edits in selected areas");
-    mutate_user_list(add_internal_edits, locations.clone(), &settings.csv_location, users.clone());
+    mutate_user_list(add_internal_edits, &locations, &settings.csv_location, users.clone());
     //If enabled remove users who have edits outside selected areas
     if settings.no_edits_outside {
         info!("Removing users who have edits outside selected areas");
-        mutate_user_list(remove_external_edits, locations.clone(), &settings.csv_location, users.clone());
+        mutate_user_list(remove_external_edits, &locations, &settings.csv_location, users.clone());
     }
 
     //Set of search areas that user must be present in
@@ -329,32 +330,30 @@ fn find_user(settings: &Settings) -> Option<String> {
 /**
  * Add users who have edits inside selected areas to the HashMap
  */
-fn add_internal_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, receiver: Receiver<String>, locations: Arc<Vec<SearchArea>>) {
-    for line in receiver {
-        //Convert line to struct
-        let row_result = match CanvasLine::parse(&line) {
-            Ok((_, v)) => { v }
-            Err(_) => {
-                warn!("Malformed line in data: {}", line);
-                continue;
+fn add_internal_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, line: &str, locations: &Vec<SearchArea>) {
+    //Convert line to struct
+    let row_result = match CanvasLine::parse(line) {
+        Ok((_, v)) => { v }
+        Err(_) => {
+            warn!("Malformed line in data: {}", line);
+            return;
+        }
+    };
+    //Check if coordinates in selected areas
+    for location in locations.deref() {
+        //Check if search area matches the line
+        if !location.contains(&row_result) {
+            continue;
+        }
+        //Matches, add area to the set of areas user has placed pixels in
+        match users.lock() {
+            Ok(mut g) => {
+                let region_set = g.entry(row_result.user_id.clone())
+                    .or_insert_with(|| { HashSet::<TileRegion>::new() });
+                region_set.insert(location.area.clone());
             }
-        };
-        //Check if coordinates in selected areas
-        for location in locations.deref() {
-            //Check if search area matches the line
-            if !location.contains(&row_result) {
-                continue;
-            }
-            //Matches, add area to the set of areas user has placed pixels in
-            match users.lock() {
-                Ok(mut g) => {
-                    let region_set = g.entry(row_result.user_id.clone())
-                        .or_insert_with(|| { HashSet::<TileRegion>::new() });
-                    region_set.insert(location.area.clone());
-                }
-                Err(e) => {
-                    eprintln!("Mutex lock failed: {}", e);
-                }
+            Err(e) => {
+                eprintln!("Mutex lock failed: {}", e);
             }
         }
     }
@@ -363,43 +362,41 @@ fn add_internal_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, r
 /**
  * Remove users who have edits outside selected areas from the HashMap
  */
-fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, receiver: Receiver<String>, locations: Arc<Vec<SearchArea>>) {
-    for line in receiver {
-        let row_result = match CanvasLine::parse(&line) {
-            Ok((_, v)) => { v }
-            Err(_) => {
-                warn!("Malformed line in data: {}", line);
-                continue;
-            }
-        };
+fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, line: &str, locations: &Vec<SearchArea>) {
+    let row_result = match CanvasLine::parse(line) {
+        Ok((_, v)) => { v }
+        Err(_) => {
+            warn!("Malformed line in data: {}", line);
+            return;
+        }
+    };
 
-        //Remove users who have edits outside locations
-        let mut is_outside = true;
-        for location in &*locations {
-            match &row_result.coordinate {
-                LineCoordinate::Tile(t) => {
-                    if location.area.contains(t) {
-                        is_outside = false;
-                        break;
-                    }
+    //Remove users who have edits outside locations
+    let mut is_outside = true;
+    for location in &*locations {
+        match &row_result.coordinate {
+            LineCoordinate::Tile(t) => {
+                if location.area.contains(t) {
+                    is_outside = false;
+                    break;
                 }
-                LineCoordinate::Region(r) => {
-                    if location.area.intersects(r) {
-                        is_outside = false;
-                        break;
-                    }
+            }
+            LineCoordinate::Region(r) => {
+                if location.area.intersects(r) {
+                    is_outside = false;
+                    break;
                 }
             }
         }
-        //Edit is not in any selected area
-        if is_outside {
-            match users.lock() {
-                Ok(mut g) => {
-                    g.remove(&row_result.user_id);
-                }
-                Err(e) => {
-                    eprintln!("Mutex lock failed: {}", e);
-                }
+    }
+    //Edit is not in any selected area
+    if is_outside {
+        match users.lock() {
+            Ok(mut g) => {
+                g.remove(&row_result.user_id);
+            }
+            Err(e) => {
+                eprintln!("Mutex lock failed: {}", e);
             }
         }
     }
@@ -408,25 +405,11 @@ fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>
 /**
  * Function that calls the supplied function on the rows of the text file in a thread
  */
-fn mutate_user_list<F: 'static>(update_func: F, locations: Arc<Vec<SearchArea>>, file_name: &str, users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>)
-    where F: Fn(Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, Receiver<String>, Arc<Vec<SearchArea>>) + std::marker::Send + std::marker::Sync + Copy {
-    let (sender, receiver) = bounded(2048);
-
+fn mutate_user_list<F: 'static>(update_func: F, locations: &Vec<SearchArea>, file_name: &str, users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>)
+    where F: Fn(Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, &str, &Vec<SearchArea>) + std::marker::Send + std::marker::Sync + Copy {
     let file = File::open(file_name)
         .expect("Failed to open tile data");
     let reader = BufReader::new(&file);
-
-    //Double thread count to optimize scheduler behaviour
-    let thread_count = num_cpus::get() * 2;
-    let mut thread_handles = Vec::with_capacity(thread_count);
-    for _ in 0..thread_count {
-        let receiver_clone = receiver.clone();
-        let user_clone = users.clone();
-        let location_clone = locations.clone();
-        thread_handles.push(thread::spawn(move || {
-            update_func(user_clone, receiver_clone, location_clone);
-        }));
-    }
 
     //Iterate over rows to find ALL users who placed tiles inside locations
     let mut line_reader = reader.lines();
@@ -434,24 +417,16 @@ fn mutate_user_list<F: 'static>(update_func: F, locations: Arc<Vec<SearchArea>>,
         panic!("Could not skip CSV header");
     };
 
-    for line_result in line_reader {
+    line_reader.par_bridge().for_each(|line_result| {
         match line_result {
             Ok(l) => {
-                sender.send(l)
-                    .expect("Can not send value, channel closed unexpectedly");
+                update_func(users.clone(), &l, locations);
             }
             Err(e) => {
                 warn!("Failed to obtain line from tile data: {}", e);
             }
         };
-    }
-    //Drop sender so threads shut down
-    drop(sender);
-
-    //Wait for threads to finish
-    for i in thread_handles {
-        i.join().unwrap();
-    }
+    });
 }
 
 /**
