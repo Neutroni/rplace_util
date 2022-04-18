@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::{env, io, thread};
+use std::{env, io};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -247,13 +247,13 @@ fn find_user(settings: &Settings) -> Option<String> {
         HashMap::<String, HashSet<TileRegion>>::new()));
 
     //Get list of potential users in selected areas
-    let locations = Arc::new(settings.search_areas.clone());
+    let locations = &settings.search_areas;
     info!("Finding users who have edits in selected areas");
-    mutate_user_list(add_internal_edits, locations.clone(), &settings.csv_location, users.clone());
+    mutate_user_list(add_internal_edits, locations, &settings.csv_location, users.clone());
     //If enabled remove users who have edits outside selected areas
     if settings.no_edits_outside {
         info!("Removing users who have edits outside selected areas");
-        mutate_user_list(remove_external_edits, locations.clone(), &settings.csv_location, users.clone());
+        mutate_user_list(remove_external_edits, locations, &settings.csv_location, users.clone());
     }
 
     //Set of search areas that user must be present in
@@ -329,7 +329,7 @@ fn find_user(settings: &Settings) -> Option<String> {
 /**
  * Add users who have edits inside selected areas to the HashMap
  */
-fn add_internal_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, receiver: Receiver<String>, locations: Arc<Vec<SearchArea>>) {
+fn add_internal_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, receiver: Receiver<String>, locations: &Vec<SearchArea>) {
     for line in receiver {
         //Convert line to struct
         let row_result = match CanvasLine::parse(&line) {
@@ -363,7 +363,7 @@ fn add_internal_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, r
 /**
  * Remove users who have edits outside selected areas from the HashMap
  */
-fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, receiver: Receiver<String>, locations: Arc<Vec<SearchArea>>) {
+fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, receiver: Receiver<String>, locations: &Vec<SearchArea>) {
     for line in receiver {
         let row_result = match CanvasLine::parse(&line) {
             Ok((_, v)) => { v }
@@ -408,50 +408,44 @@ fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>
 /**
  * Function that calls the supplied function on the rows of the text file in a thread
  */
-fn mutate_user_list<F: 'static>(update_func: F, locations: Arc<Vec<SearchArea>>, file_name: &str, users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>)
-    where F: Fn(Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, Receiver<String>, Arc<Vec<SearchArea>>) + std::marker::Send + std::marker::Sync + Copy {
+fn mutate_user_list<F: 'static>(update_func: F, locations: &Vec<SearchArea>, file_name: &str, users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>)
+    where F: Fn(Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, Receiver<String>, &Vec<SearchArea>) + std::marker::Send + std::marker::Sync + Copy {
     let (sender, receiver) = bounded(2048);
 
     let file = File::open(file_name)
         .expect("Failed to open tile data");
     let reader = BufReader::new(&file);
 
-    //Double thread count to optimize scheduler behaviour
-    let thread_count = num_cpus::get() * 2;
-    let mut thread_handles = Vec::with_capacity(thread_count);
-    for _ in 0..thread_count {
-        let receiver_clone = receiver.clone();
-        let user_clone = users.clone();
-        let location_clone = locations.clone();
-        thread_handles.push(thread::spawn(move || {
-            update_func(user_clone, receiver_clone, location_clone);
-        }));
-    }
+    let thread_count = num_cpus::get();
+    crossbeam_utils::thread::scope(|s| {
+        for _ in 0..thread_count {
+            let receiver_clone = receiver.clone();
+            let user_clone = users.clone();
+            s.spawn(|_| {
+                update_func(user_clone, receiver_clone, locations);
+            });
+        }
 
-    //Iterate over rows to find ALL users who placed tiles inside locations
-    let mut line_reader = reader.lines();
-    if line_reader.next().is_none() {
-        panic!("Could not skip CSV header");
-    };
-
-    for line_result in line_reader {
-        match line_result {
-            Ok(l) => {
-                sender.send(l)
-                    .expect("Can not send value, channel closed unexpectedly");
-            }
-            Err(e) => {
-                warn!("Failed to obtain line from tile data: {}", e);
-            }
+        //Iterate over rows to find ALL users who placed tiles inside locations
+        let mut line_reader = reader.lines();
+        if line_reader.next().is_none() {
+            panic!("Could not skip CSV header");
         };
-    }
-    //Drop sender so threads shut down
-    drop(sender);
 
-    //Wait for threads to finish
-    for i in thread_handles {
-        i.join().unwrap();
-    }
+        for line_result in line_reader {
+            match line_result {
+                Ok(l) => {
+                    sender.send(l)
+                        .expect("Can not send value, channel closed unexpectedly");
+                }
+                Err(e) => {
+                    warn!("Failed to obtain line from tile data: {}", e);
+                }
+            };
+        }
+        //Drop sender so threads shut down
+        drop(sender);
+    }).expect("Failed to construct thread scope");
 }
 
 /**
