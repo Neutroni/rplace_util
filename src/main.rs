@@ -3,7 +3,6 @@ use std::{env, io};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use config::Config;
 use rayon::iter::ParallelBridge;
@@ -190,7 +189,22 @@ impl SearchArea {
                 if !self.area.intersects(r) {
                     return false;
                 }
-                false
+                let line_time = PrimitiveDateTime::parse(&pixel.timestamp, RPLACE_TIME_FORMAT)
+                    .or_else(|_| {
+                        PrimitiveDateTime::parse(&pixel.timestamp, RPLACE_TIME_FORMAT_SHORT)
+                    })
+                    .expect(&*format!("Can not parse: {} Malformed time in CSV", &pixel.timestamp));
+                if let Some(start_time) = self.start_time {
+                    if start_time < line_time {
+                        return false;
+                    }
+                }
+                if let Some(end_time) = self.end_time {
+                    if line_time > end_time {
+                        return false;
+                    }
+                }
+                true
             }
         }
     }
@@ -340,7 +354,7 @@ fn add_internal_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, l
         }
     };
     //Check if coordinates in selected areas
-    for location in locations.deref() {
+    for location in locations {
         //Check if search area matches the line
         if !location.contains(&row_result) {
             continue;
@@ -373,7 +387,7 @@ fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>
 
     //Remove users who have edits outside locations
     let mut is_outside = true;
-    for location in &*locations {
+    for location in locations {
         match &row_result.coordinate {
             LineCoordinate::Tile(t) => {
                 if location.area.contains(t) {
