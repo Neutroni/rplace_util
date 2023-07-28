@@ -1,9 +1,11 @@
 #user_id="anKIPTxg1QiKoFkJRNlgsFOWlJ+3Q1puTs0T/+eysi+MTvRbsZJId2OTsGXIdyM27CFkq6IUxBxRtVsnCFYyTg=="
 csv_location = "2022_place_canvas_history.csv"
+year = "Place2022"
 no_edits_outside = true
 [[search_areas]]
-#start_time = 2022-04-01 12:00:00.001 UTC
-#end_time = 2022-04-04 12:00:00.001 UTC
+#start_time = "2022-04-01 12:00:00.001 UTC"
+#end_time = "2022-04-04 12:00:00.001 UTC"
+#colours = ["#B44AC0"]
 #is_required = false
 [search_areas.area]
 left=496

@@ -5,13 +5,15 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
 use config::Config;
+use env_logger::Env;
 use rayon::iter::ParallelBridge;
 use rayon::prelude::ParallelIterator;
 use log::{error, info, warn};
-use nom::IResult;
+use nom::{bytes, IResult};
 use nom::bytes::complete::{take_until};
 use nom::branch::alt;
 use nom::character::complete;
+use nom::combinator::eof;
 use nom::sequence::{delimited, terminated};
 use serde::Deserialize;
 use time::format_description::FormatItem;
@@ -19,8 +21,8 @@ use time::PrimitiveDateTime;
 
 #[derive(Eq, PartialEq, Hash, Deserialize, Clone)]
 struct TileLocation {
-    x: u16,
-    y: u16,
+    x: i16,
+    y: i16,
 }
 
 impl Display for TileLocation {
@@ -31,8 +33,8 @@ impl Display for TileLocation {
 
 impl TileLocation {
     fn parse(input: &str) -> IResult<&str, LineCoordinate> {
-        let (input, x) = terminated(complete::u16, complete::char(','))(input)?;
-        let (input, y) = complete::u16(input)?;
+        let (input, x) = terminated(complete::i16, complete::char(','))(input)?;
+        let (input, y) = complete::i16(input)?;
         Ok((input, LineCoordinate::Tile(TileLocation {
             x,
             y,
@@ -42,19 +44,19 @@ impl TileLocation {
 
 #[derive(Eq, PartialEq, Hash, Deserialize, Clone)]
 struct TileRegion {
-    top: u16,
-    left: u16,
-    bottom: u16,
-    right: u16,
+    top: i16,
+    left: i16,
+    bottom: i16,
+    right: i16,
 }
 
 impl TileRegion {
     fn parse_line(input: &str) -> IResult<&str, LineCoordinate> {
         //1349,1718,1424,1752
-        let (input, start_x) = terminated(complete::u16, complete::char(','))(input)?;
-        let (input, start_y) = terminated(complete::u16, complete::char(','))(input)?;
-        let (input, end_x) = terminated(complete::u16, complete::char(','))(input)?;
-        let (input, end_y) = complete::u16(input)?;
+        let (input, start_x) = terminated(complete::i16, complete::char(','))(input)?;
+        let (input, start_y) = terminated(complete::i16, complete::char(','))(input)?;
+        let (input, end_x) = terminated(complete::i16, complete::char(','))(input)?;
+        let (input, end_y) = complete::i16(input)?;
         Ok((input, LineCoordinate::Region(TileRegion {
             left: start_x,
             top: start_y,
@@ -64,22 +66,10 @@ impl TileRegion {
     }
 
     fn contains(&self, location: &TileLocation) -> bool {
-        if location.x < self.left {
-            return false;
-        }
-        if location.y < self.top {
-            return false;
-        }
-        if location.x > self.right {
-            return false;
-        }
-        if location.y > self.bottom {
-            return false;
-        }
-        true
+        self.contains_point(location.x, location.y)
     }
 
-    fn contains_point(&self, x: u16, y: u16) -> bool {
+    fn contains_point(&self, x: i16, y: i16) -> bool {
         if x < self.left {
             return false;
         }
@@ -107,15 +97,100 @@ impl TileRegion {
     }
 }
 
+#[derive(Eq, PartialEq, Hash, Deserialize, Clone)]
+struct TileCircle {
+    x: i16,
+    y: i16,
+    r: i16,
+}
+
+impl TileCircle {
+    fn parse_line(input: &str) -> IResult<&str, LineCoordinate> {
+        //{X: 425, Y: 441, R: 2}
+        let (input, _) = bytes::complete::tag("{X: ")(input)?;
+        let (input, x) = terminated(complete::i16, complete::char(','))(input)?;
+        let (input, _) = bytes::complete::tag(" Y: ")(input)?;
+        let (input, y) = terminated(complete::i16, complete::char(','))(input)?;
+        let (input, _) = bytes::complete::tag(" R: ")(input)?;
+        let (input, r) = terminated(complete::i16, complete::char('}'))(input)?;
+        Ok((input, LineCoordinate::Circle(TileCircle {
+            x,
+            y,
+            r,
+        })))
+    }
+
+    fn contains_point(&self, x: i16, y: i16) -> bool {
+        let x_dist = (x - self.x) as f64;
+        let y_dist = (y - self.y) as f64;
+        let dist = f64::sqrt((x_dist * x_dist) + (y_dist * y_dist));
+        dist < self.r as f64
+    }
+
+    fn intersects(&self, region: &TileRegion) -> bool {
+        self.contains_point(region.left, region.top)
+            || self.contains_point(region.right, region.top)
+            || self.contains_point(region.right, region.bottom)
+            || self.contains_point(region.left, region.bottom)
+            || region.contains_point(self.x + self.r, self.y + self.r)
+            || region.contains_point(self.x - self.r, self.y - self.r)
+            || region.contains_point(self.x + self.r, self.y - self.r)
+            || region.contains_point(self.x - self.r, self.y + self.r)
+    }
+
+    fn points(&self) -> Vec<TileLocation> {
+        let mut pixels: Vec<TileLocation> = Vec::new();
+
+        let mut x = self.r;
+        let mut y = 0;
+        let mut radius_error = 1 - x;
+
+        while x >= y
+        {
+            let mut start_x = -x + self.x;
+            let mut end_x = x + self.y;
+            self.line_points(&mut pixels, start_x, end_x, y + self.y);
+            if y != 0 {
+                self.line_points(&mut pixels, start_x, end_x, -y + self.y);
+            }
+            y += 1;
+
+            if radius_error < 0 {
+                radius_error += 2 * y + 1;
+            } else {
+                if x >= y {
+                    start_x = -y + 1 + self.x;
+                    end_x = y - 1 + self.x;
+                    self.line_points(&mut pixels, start_x, end_x, x + self.y);
+                    self.line_points(&mut pixels, start_x, end_x, -x + self.y);
+                }
+                x -= 1;
+                radius_error += 2 * (y - x + 1);
+            }
+        }
+        pixels
+    }
+
+    fn line_points(&self, pixels: &mut Vec<TileLocation>, from_x: i16, to_x: i16, y: i16) {
+        for x in from_x..to_x {
+            pixels.push(TileLocation {
+                x,
+                y,
+            });
+        }
+    }
+}
+
 #[derive(Eq, PartialEq, Hash)]
 enum LineCoordinate {
     Tile(TileLocation),
     Region(TileRegion),
+    Circle(TileCircle),
 }
 
 impl LineCoordinate {
     fn parse(input: &str) -> IResult<&str, LineCoordinate> {
-        alt((TileRegion::parse_line, TileLocation::parse))(input)
+        alt((TileRegion::parse_line, TileLocation::parse, TileCircle::parse_line))(input)
     }
 }
 
@@ -127,7 +202,7 @@ struct CanvasLine {
 }
 
 impl CanvasLine {
-    fn parse(input: &str) -> IResult<&str, CanvasLine> {
+    fn parse2022(input: &str) -> IResult<&str, CanvasLine> {
         //2022-04-04 00:55:57.168 UTC,tPcrtm7OtEmSThdRSWmB7jmTF9lUVZ1pltNv1oKqPY9bom/EGIO3/b5kjRenbD3vMF48psnR9MnhIrTT1bpC9A==,#6A5CFF,"1908,1854"
         let (input, timestamp) = terminated(take_until(","), complete::char(','))(input)?;
         //tPcrtm7OtEmSThdRSWmB7jmTF9lUVZ1pltNv1oKqPY9bom/EGIO3/b5kjRenbD3vMF48psnR9MnhIrTT1bpC9A==,#6A5CFF,"1908,1854"
@@ -136,6 +211,23 @@ impl CanvasLine {
         let (input, pixel_color) = terminated(take_until(","), complete::char(','))(input)?;
         //"1908,1854" or "1349,1718,1424,1752"
         let (input, coordinate) = delimited(complete::char('"'), LineCoordinate::parse, complete::char('"'))(input)?;
+
+        Ok((input, CanvasLine {
+            timestamp: timestamp.to_string(),
+            user_id: user_id.to_string(),
+            pixel_color: pixel_color.to_string(),
+            coordinate,
+        }))
+    }
+    fn parse2023(input: &str) -> IResult<&str, CanvasLine> {
+        //2023-07-20 18:55:57.168 UTC,tPcrtm7OtEmSThdRSWmB7jmTF9lUVZ1pltNv1oKqPY9bom/EGIO3/b5kjRenbD3vMF48psnR9MnhIrTT1bpC9A==,"1908,1854",#6A5CFF
+        let (input, timestamp) = terminated(take_until(","), complete::char(','))(input)?;
+        //tPcrtm7OtEmSThdRSWmB7jmTF9lUVZ1pltNv1oKqPY9bom/EGIO3/b5kjRenbD3vMF48psnR9MnhIrTT1bpC9A==,"1908,1854",#6A5CFF
+        let (input, user_id) = terminated(take_until(","), complete::char(','))(input)?;
+        //"1908,1854" or "1349,1718,1424,1752" or "{X: 481, Y: 416, R: 3}"
+        let (input, coordinate) = delimited(complete::char('"'), LineCoordinate::parse, complete::char('"'))(input)?;
+        //#6A5CFF
+        let (input, pixel_color) = delimited(complete::char(','), bytes::complete::take(7usize), eof)(input)?;
 
         Ok((input, CanvasLine {
             timestamp: timestamp.to_string(),
@@ -156,6 +248,8 @@ struct SearchArea {
     end_time: Option<PrimitiveDateTime>,
     #[serde(default)]
     is_optional: bool,
+    #[serde(default)]
+    colours: Vec<String>,
     area: TileRegion,
 }
 
@@ -163,64 +257,62 @@ impl SearchArea {
     fn contains(&self, pixel: &CanvasLine) -> bool {
         const RPLACE_TIME_FORMAT: &[FormatItem] = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond] UTC");
         const RPLACE_TIME_FORMAT_SHORT: &[FormatItem] = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second] UTC");
+
+        let line_time = PrimitiveDateTime::parse(&pixel.timestamp, RPLACE_TIME_FORMAT)
+            .or_else(|_| {
+                PrimitiveDateTime::parse(&pixel.timestamp, RPLACE_TIME_FORMAT_SHORT)
+            })
+            .unwrap_or_else(|_| panic!("Can not parse: {} Malformed time in CSV", &pixel.timestamp));
+        if let Some(start_time) = self.start_time {
+            if start_time < line_time {
+                return false;
+            }
+        }
+        if let Some(end_time) = self.end_time {
+            if line_time > end_time {
+                return false;
+            }
+        }
+        if !self.colours.is_empty() && !self.colours.contains(&pixel.pixel_color) {
+            return false;
+        }
+
         match &pixel.coordinate {
             LineCoordinate::Tile(t) => {
-                if !self.area.contains(t) {
-                    return false;
-                }
-                let line_time = PrimitiveDateTime::parse(&pixel.timestamp, RPLACE_TIME_FORMAT)
-                    .or_else(|_| {
-                        PrimitiveDateTime::parse(&pixel.timestamp, RPLACE_TIME_FORMAT_SHORT)
-                    })
-                    .expect(&*format!("Can not parse: {} Malformed time in CSV", &pixel.timestamp));
-                if let Some(start_time) = self.start_time {
-                    if start_time < line_time {
-                        return false;
-                    }
-                }
-                if let Some(end_time) = self.end_time {
-                    if line_time > end_time {
-                        return false;
-                    }
-                }
-                true
+                self.area.contains(t)
             }
             LineCoordinate::Region(r) => {
-                if !self.area.intersects(r) {
-                    return false;
-                }
-                let line_time = PrimitiveDateTime::parse(&pixel.timestamp, RPLACE_TIME_FORMAT)
-                    .or_else(|_| {
-                        PrimitiveDateTime::parse(&pixel.timestamp, RPLACE_TIME_FORMAT_SHORT)
-                    })
-                    .expect(&*format!("Can not parse: {} Malformed time in CSV", &pixel.timestamp));
-                if let Some(start_time) = self.start_time {
-                    if start_time < line_time {
-                        return false;
-                    }
-                }
-                if let Some(end_time) = self.end_time {
-                    if line_time > end_time {
-                        return false;
-                    }
-                }
-                true
+                self.area.intersects(r)
+            }
+            LineCoordinate::Circle(c) => {
+                c.intersects(&self.area)
             }
         }
     }
 }
 
 #[derive(Deserialize)]
+enum PlaceDataSet {
+    Place2023,
+    Place2022,
+}
+
+#[derive(Deserialize)]
 struct Settings {
     user_id: Option<String>,
     csv_location: String,
+    year: PlaceDataSet,
     search_areas: Vec<SearchArea>,
     no_edits_outside: bool,
 }
 
 fn main() {
     //Init logger
-    env_logger::init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            writeln!(buf, "[{}] {}", record.level(), record.args())
+        })
+        .init();
 
     //Get config file location from command line
     let has_config_path;
@@ -252,7 +344,7 @@ fn main() {
     //Check if we have a user id
     if let Some(user) = userid {
         info!("Finding tiles that remain");
-        find_remaining_tiles(&user, &settings.csv_location);
+        find_remaining_tiles(&user, &settings.csv_location, &settings.year);
     }
 }
 
@@ -264,11 +356,28 @@ fn find_user(settings: &Settings) -> Option<String> {
     //Get list of potential users in selected areas
     let locations = &settings.search_areas;
     info!("Finding users who have edits in selected areas");
-    mutate_user_list(add_internal_edits, locations, &settings.csv_location, users.clone());
+    mutate_user_list(add_internal_edits, locations, &settings.csv_location, users.clone(), &settings.year);
+    match users.lock() {
+        Ok(g) => {
+            info!("Total users in selected area {}", g.len())
+        }
+        Err(e) => {
+            eprintln!("Mutex lock failed: {}", e);
+        }
+    }
+
     //If enabled remove users who have edits outside selected areas
     if settings.no_edits_outside {
         info!("Removing users who have edits outside selected areas");
-        mutate_user_list(remove_external_edits, locations, &settings.csv_location, users.clone());
+        mutate_user_list(remove_external_edits, locations, &settings.csv_location, users.clone(), &settings.year);
+        match users.lock() {
+            Ok(g) => {
+                info!("After removing users who have edits outside selected areas {}", g.len())
+            }
+            Err(e) => {
+                eprintln!("Mutex lock failed: {}", e);
+            }
+        }
     }
 
     //Set of search areas that user must be present in
@@ -344,15 +453,29 @@ fn find_user(settings: &Settings) -> Option<String> {
 /**
  * Add users who have edits inside selected areas to the HashMap
  */
-fn add_internal_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, line: &str, locations: &Vec<SearchArea>) {
+fn add_internal_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, line: &str, locations: &Vec<SearchArea>, year: &PlaceDataSet) {
     //Convert line to struct
-    let row_result = match CanvasLine::parse(line) {
-        Ok((_, v)) => { v }
-        Err(_) => {
-            warn!("Malformed line in data: {}", line);
-            return;
+    let row_result = match year {
+        PlaceDataSet::Place2023 => {
+            match CanvasLine::parse2023(line) {
+                Ok((_, v)) => { v }
+                Err(_) => {
+                    warn!("Malformed line in data: {}", line);
+                    return;
+                }
+            }
+        }
+        PlaceDataSet::Place2022 => {
+            match CanvasLine::parse2022(line) {
+                Ok((_, v)) => { v }
+                Err(_) => {
+                    warn!("Malformed line in data: {}", line);
+                    return;
+                }
+            }
         }
     };
+
     //Check if coordinates in selected areas
     for location in locations {
         //Check if search area matches the line
@@ -376,12 +499,25 @@ fn add_internal_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, l
 /**
  * Remove users who have edits outside selected areas from the HashMap
  */
-fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, line: &str, locations: &Vec<SearchArea>) {
-    let row_result = match CanvasLine::parse(line) {
-        Ok((_, v)) => { v }
-        Err(_) => {
-            warn!("Malformed line in data: {}", line);
-            return;
+fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, line: &str, locations: &Vec<SearchArea>, year: &PlaceDataSet) {
+    let row_result = match year {
+        PlaceDataSet::Place2023 => {
+            match CanvasLine::parse2023(line) {
+                Ok((_, v)) => { v }
+                Err(_) => {
+                    warn!("Malformed line in data: {}", line);
+                    return;
+                }
+            }
+        }
+        PlaceDataSet::Place2022 => {
+            match CanvasLine::parse2022(line) {
+                Ok((_, v)) => { v }
+                Err(_) => {
+                    warn!("Malformed line in data: {}", line);
+                    return;
+                }
+            }
         }
     };
 
@@ -397,6 +533,12 @@ fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>
             }
             LineCoordinate::Region(r) => {
                 if location.area.intersects(r) {
+                    is_outside = false;
+                    break;
+                }
+            }
+            LineCoordinate::Circle(c) => {
+                if c.intersects(&location.area) {
                     is_outside = false;
                     break;
                 }
@@ -419,8 +561,8 @@ fn remove_external_edits(users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>
 /**
  * Function that calls the supplied function on the rows of the text file in a thread
  */
-fn mutate_user_list<F: 'static>(update_func: F, locations: &Vec<SearchArea>, file_name: &str, users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>)
-    where F: Fn(Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, &str, &Vec<SearchArea>) + std::marker::Send + std::marker::Sync + Copy {
+fn mutate_user_list<F: 'static>(update_func: F, locations: &Vec<SearchArea>, file_name: &str, users: Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, year: &PlaceDataSet)
+    where F: Fn(Arc<Mutex<HashMap<String, HashSet<TileRegion>>>>, &str, &Vec<SearchArea>, &PlaceDataSet) + Send + Sync + Copy {
     let file = File::open(file_name)
         .expect("Failed to open tile data");
     let reader = BufReader::new(&file);
@@ -434,7 +576,7 @@ fn mutate_user_list<F: 'static>(update_func: F, locations: &Vec<SearchArea>, fil
     line_reader.par_bridge().for_each(|line_result| {
         match line_result {
             Ok(l) => {
-                update_func(users.clone(), &l, locations);
+                update_func(users.clone(), &l, locations, year);
             }
             Err(e) => {
                 warn!("Failed to obtain line from tile data: {}", e);
@@ -446,11 +588,16 @@ fn mutate_user_list<F: 'static>(update_func: F, locations: &Vec<SearchArea>, fil
 /**
  * Get surviving tiles
  */
-fn find_remaining_tiles(user_hash: &str, file_name: &str) {
+fn find_remaining_tiles(user_hash: &str, file_name: &str, year: &PlaceDataSet) {
     let file = File::open(file_name).expect("Failed to open tile data");
     let reader = BufReader::new(file);
 
-    const WHITEOUT_LINE: usize = 158117508;
+    const WHITEOUT_LINE_2023: usize = 126816301;
+    const WHITEOUT_LINE_2022: usize = 158117508;
+    let whiteout_line: usize = match year {
+        PlaceDataSet::Place2023 => { WHITEOUT_LINE_2023 }
+        PlaceDataSet::Place2022 => { WHITEOUT_LINE_2022 }
+    };
     let mut reached_whiteout = false;
     //Number of tiles user has placed
     let mut tiles_placed: u64 = 0;
@@ -464,7 +611,7 @@ fn find_remaining_tiles(user_hash: &str, file_name: &str) {
         panic!("Could not skip CSV header");
     };
     for (line_number, line_result) in line_reader {
-        if line_number == WHITEOUT_LINE {
+        if line_number == whiteout_line {
             reached_whiteout = true;
         }
 
@@ -476,11 +623,24 @@ fn find_remaining_tiles(user_hash: &str, file_name: &str) {
             }
         };
 
-        let row_result = match CanvasLine::parse(&line) {
-            Ok((_, v)) => { v }
-            Err(_) => {
-                warn!("Malformed line in data: {}", line);
-                continue;
+        let row_result = match year {
+            PlaceDataSet::Place2023 => {
+                match CanvasLine::parse2023(&line) {
+                    Ok((_, v)) => { v }
+                    Err(_) => {
+                        warn!("Malformed line in data: {}", line);
+                        continue;
+                    }
+                }
+            }
+            PlaceDataSet::Place2022 => {
+                match CanvasLine::parse2022(&line) {
+                    Ok((_, v)) => { v }
+                    Err(_) => {
+                        warn!("Malformed line in data: {}", line);
+                        continue;
+                    }
+                }
             }
         };
 
@@ -491,7 +651,7 @@ fn find_remaining_tiles(user_hash: &str, file_name: &str) {
             //Check if the tile is a region
             match row_result.coordinate {
                 LineCoordinate::Tile(t) => {
-                    info!("Found {} tile placed at: {},{}", row_result.pixel_color, t.x, t.y);
+                    info!("Found {} Color: {} tile placed at: {},{}", row_result.timestamp, row_result.pixel_color, t.x, t.y);
                     //Add tiles that could have survived to the whiteout
                     if !reached_whiteout {
                         whiteout_tiles.insert(t.clone(), row_result.pixel_color.clone());
@@ -515,6 +675,17 @@ fn find_remaining_tiles(user_hash: &str, file_name: &str) {
                         }
                     }
                 }
+                LineCoordinate::Circle(c) => {
+                    let points = c.points();
+                    for p in points {
+                        //Remove tiles that did not survive to the whiteout
+                        if !reached_whiteout {
+                            whiteout_tiles.insert(p.clone(), row_result.pixel_color.clone());
+                        }
+                        //Remove tiles that did not survive to the end
+                        end_tiles.insert(p, row_result.timestamp.clone());
+                    }
+                }
             }
         } else {
             //Was not current user, remove from tiles if present
@@ -533,6 +704,12 @@ fn find_remaining_tiles(user_hash: &str, file_name: &str) {
                                 y: j,
                             });
                         }
+                    }
+                }
+                LineCoordinate::Circle(c) => {
+                    let points = c.points();
+                    for p in points {
+                        whiteout_tiles.remove(&p);
                     }
                 }
             }
